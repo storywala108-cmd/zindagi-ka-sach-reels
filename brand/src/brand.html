@@ -1,0 +1,62 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+@font-face { font-family: Tiro; src: url(../../fonts/TiroDevanagariHindi-Regular.ttf); }
+@font-face { font-family: Mukta; src: url(../../fonts/Mukta-ExtraBold.ttf); }
+@font-face { font-family: Poppins; src: url(../../fonts/Poppins-Black.ttf); }
+:root { --paper: #f6eedd; --ink: #3b2a1a; --mustard: #c9922b; --muted: #8a6f4d; }
+* { margin: 0; box-sizing: border-box; }
+body { background: var(--paper); }
+.art { position: relative; overflow: hidden; background: var(--paper); }
+.title { font-family: Tiro; color: var(--ink); line-height: 1.05; }
+.title b { color: var(--mustard); font-weight: normal; }
+.tag { font-family: Mukta; color: var(--muted); }
+.latin { font-family: Poppins; color: var(--ink); letter-spacing: .18em; text-transform: uppercase; }
+.rule { height: 4px; background: var(--mustard); border-radius: 2px; }
+/* fade the scene paintings into the paper */
+.scene { position: absolute; object-fit: cover; mix-blend-mode: multiply; }
+#profile { background: rgb(252, 239, 211); } /* = the mascot painting's own paper, so no visible square */
+.mid { white-space: nowrap; z-index: 1; }
+/* soft paper glow so the title never fights the paintings */
+.mid::before { content: ''; position: absolute; inset: -60px -90px; z-index: -1;
+  background: radial-gradient(closest-side, var(--paper) 62%, rgba(246,238,221,0)); }
+.fade-r { -webkit-mask-image: linear-gradient(to right, #000 55%, transparent); }
+.fade-l { -webkit-mask-image: linear-gradient(to left, #000 55%, transparent); }
+
+#profile { width: 1080px; height: 1080px; }
+#profile img { position: absolute; left: 140px; top: 70px; width: 800px; height: 800px; }
+#profile .title { position: absolute; width: 100%; text-align: center; top: 820px; font-size: 118px; }
+
+#cover { width: 1640px; height: 856px; }
+#cover .l { left: 0; top: 0; width: 640px; height: 856px; }
+#cover .r { right: 0; top: 0; width: 640px; height: 856px; }
+#cover .mid { position: absolute; left: 420px; width: 800px; top: 270px; text-align: center; }
+
+#banner { width: 2560px; height: 1440px; }
+#banner .l { left: 0; top: 0; width: 1100px; height: 1440px; }
+#banner .r { right: 0; top: 0; width: 1100px; height: 1440px; }
+/* YouTube shows every device only the centre 1546x423 (y 508-931): all text sits inside it */
+#banner .mid { position: absolute; left: 730px; width: 1100px; top: 560px; text-align: center; }
+</style></head>
+<body>
+<div id="profile" class="art"><img src="mascot.png"><div class="title">ज़िंदगी का <b>सच</b></div></div>
+
+<div id="cover" class="art">
+  <img class="scene l fade-r" src="scene_left.png"><img class="scene r fade-l" src="scene_right.png">
+  <div class="mid">
+    <div class="title" style="font-size:118px">ज़िंदगी का <b>सच</b></div>
+    <div class="rule" style="width:200px;margin:14px auto 20px"></div>
+    <div class="tag" style="font-size:50px">हर कहानी में एक सबक</div>
+    <div class="latin" style="font-size:24px;margin-top:22px">Roz nayi kahani · 9 AM &amp; 6 PM</div>
+  </div>
+</div>
+
+<div id="banner" class="art">
+  <img class="scene l fade-r" src="scene_left.png"><img class="scene r fade-l" src="scene_right.png">
+  <div class="mid">
+    <div class="title" style="font-size:150px">ज़िंदगी का <b>सच</b></div>
+    <div class="rule" style="width:260px;margin:10px auto 16px"></div>
+    <div class="tag" style="font-size:60px">हर कहानी में एक सबक</div>
+  </div>
+</div>
+</body></html>
