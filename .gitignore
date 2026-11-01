@@ -1,0 +1,6 @@
+.env
+temp/
+output/
+models/
+logs/reel.log
+node_modules/

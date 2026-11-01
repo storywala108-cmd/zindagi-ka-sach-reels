@@ -1,0 +1,474 @@
+// "Zindagi Ka Sach" story reel pipeline (runs on GitHub Actions or the laptop).
+//   node zks.js make [topic]   -> script + voice + images + render (no posting)
+//   node zks.js post <runId>   -> publish a rendered reel to the Facebook page
+//   node zks.js all            -> make + post (scheduled runs)
+// Keys only from .env / repository secrets; masked in every log line.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const ROOT = process.env.REEL_ROOT || path.resolve(__dirname, '..');
+const DIR = { temp: path.join(ROOT, 'temp'), output: path.join(ROOT, 'output'), logs: path.join(ROOT, 'logs'), music: path.join(ROOT, 'music'), fonts: path.join(ROOT, 'fonts') };
+const FPS = 30, W = 1080, H = 1920, IMG = 1000, IMG_X = 40, IMG_Y = 430;
+const CF_MODEL = '@cf/black-forest-labs/flux-2-klein-4b';
+// our own look: soft storybook doodles, never the reference page's characters or watermark
+const STYLE = 'soft hand-drawn storybook illustration, simple stick-figure people with round heads and dot eyes, thin black ink outlines, '
+  + 'warm cream paper background, muted earthy watercolor fills, gentle shading, minimal clean composition, square frame, '
+  + 'absolutely no text, letters, numbers, signs or watermark';
+
+// ---------- env + logging ----------
+function loadEnv() {
+  const file = path.join(ROOT, '.env');
+  if (!fs.existsSync(file)) return { ...process.env };
+  const env = { ...process.env };
+  for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || !line.includes('=')) continue;
+    const i = line.indexOf('=');
+    env[line.slice(0, i).trim()] = line.slice(i + 1).trim().replace(/^["']|["']$/g, '');
+  }
+  return env;
+}
+const ENV = loadEnv();
+if (/^true$/i.test(process.env.DRY_RUN || '')) ENV.POST_ENABLED = 'false';
+const SECRETS = Object.entries(ENV).filter(([k, v]) => /KEY|TOKEN|SECRET|ACCOUNT_ID/i.test(k) && v && v.length > 5).map(([, v]) => v);
+const mask = (s) => SECRETS.reduce((t, sec) => t.split(sec).join('***'), String(s));
+let RUN = '-';
+function log(msg) {
+  const line = `${new Date().toISOString()} [${RUN}] ${mask(msg)}`;
+  fs.appendFileSync(path.join(DIR.logs, 'reel.log'), line + '\n', 'utf8');
+  console.error(line);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function httpJson(url, opts = {}, timeoutMs = 120000) {
+  try {
+    const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
+    const text = await res.text();
+    let body; try { body = JSON.parse(text); } catch { body = { raw: text.slice(0, 500) }; }
+    return { ok: res.ok, status: res.status, body };
+  } catch (e) { return { ok: false, status: 0, body: { error: e.message } }; }
+}
+function run(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, windowsHide: true });
+  if (r.status !== 0) throw new Error(`${path.basename(cmd)} failed: ${(r.stderr || r.error || '').toString().slice(-400)}`);
+  return r.stdout || '';
+}
+const dur = (f) => parseFloat(run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f]));
+const PY = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+function istStamp() {
+  const t = new Date(Date.now() + 5.5 * 3600e3).toISOString();
+  return { date: t.slice(0, 10), id: t.slice(0, 19).replace(/[-:]/g, '').replace('T', '-') };
+}
+const runDir = (id) => path.join(DIR.temp, id);
+const saveState = (s) => fs.writeFileSync(path.join(runDir(s.runId), 'state.json'), JSON.stringify(s, null, 2), 'utf8');
+const loadState = (id) => JSON.parse(fs.readFileSync(path.join(runDir(id), 'state.json'), 'utf8'));
+
+// ---------- step 1: story script (Gemini, JSON) ----------
+const SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    topic: { type: 'STRING' }, title: { type: 'STRING' },
+    hook: { type: 'OBJECT', properties: { line1: { type: 'STRING' }, line2: { type: 'STRING' }, highlight: { type: 'STRING' } }, required: ['line1', 'line2', 'highlight'] },
+    scenes: { type: 'ARRAY', items: { type: 'OBJECT', properties: { hi: { type: 'STRING' }, roman: { type: 'STRING' }, image: { type: 'STRING' } }, required: ['hi', 'roman', 'image'] } },
+    caption: { type: 'STRING' }, hashtags: { type: 'ARRAY', items: { type: 'STRING' } },
+  },
+  required: ['topic', 'title', 'hook', 'scenes', 'caption', 'hashtags'],
+};
+const readList = (f) => { try { return fs.readFileSync(path.join(ROOT, f), 'utf8').split(/\r?\n/).map((s) => s.trim()).filter((s) => s && !s.startsWith('#')); } catch { return []; } };
+function scriptPrompt(topic) {
+  const used = readList('logs/used-topics.txt').slice(-60);
+  const avoid = readList('avoid-topics.txt');
+  return `You write short Hindi story reels for the Facebook page "Zindagi Ka Sach": every reel is ONE short original story or parable (people, animals, a village, a city, an office, a family) that ends on a sharp life lesson about human nature, money, relationships, patience, society or "the system".
+${topic ? `Story idea from the owner: "${topic}"` : 'Invent a fresh, surprising story idea yourself.'}
+It must feel hand-written by a real Indian storyteller: simple spoken Hindi, short sentences, a twist near the end, and a last line that hits hard. Never preachy, no "आइए जानते हैं", no "तो दोस्तों", no "क्या आप जानते हैं".
+Never reuse any of these story ideas (ours, already posted):
+${used.length ? used.map((u) => '  - ' + u).join('\n') : '  (none yet)'}
+Never tell any of these well-known stories of another page (they must stay different):
+${avoid.length ? avoid.map((u) => '  - ' + u).join('\n') : '  (none)'}
+Return JSON only:
+- topic: the story idea in 4-8 English words (for our used list).
+- title: Facebook title in Hinglish (Roman letters), max 70 characters, a curiosity question or bold line, ending with one emoji (💀, 😶, 💔, 🔥, 🤯 or ⏳).
+- hook: the text shown on top of the video for the whole reel, Hinglish in Roman letters, like "Bro just exposed the system" / "Har problem permanent nahi hoti": line1 max 22 characters, line2 max 22 characters, highlight = ONE word from line1 or line2 shown in yellow.
+- scenes: 6 to 12 scenes telling the WHOLE story: a beginning, what happens, the twist, a clear ending (what finally happened to the characters), and as the LAST scene the lesson in one sharp line. Never stop halfway or leave the ending open. Together 90-180 spoken words (about 35-80 seconds); use only as many words as the story needs. For each scene:
+  - hi: what the narrator says, in Hindi Devanagari (English words also in Devanagari). Numbers as words.
+  - roman: the SAME words transliterated word by word into simple Hinglish Roman letters (same number of words as hi, same order), e.g. "एक किसान ने" -> "Ek kisaan ne".
+  - image: an English description of ONE square illustration for this moment: who, where, what is happening, the emotion. Keep the same characters looking the same across scenes (describe them the same way each time, e.g. "a thin stick-figure man in a blue shirt"). Do NOT name a drawing style (no "realistic", "photo", "cinematic") and no names of people or brands. Nothing gory or medical-graphic. No text in the image.
+- caption: 1-2 short Hinglish lines (Roman letters) that make people comment, e.g. a question to the viewer.
+- hashtags: 5-7 relevant hashtags.`;
+}
+async function gemini(model, body) {
+  return httpJson(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': ENV.GEMINI_API_KEY }, body: JSON.stringify(body),
+  }, 120000);
+}
+async function stepScript(s, topic, shorter = 0, maxSecs = 88) {
+  const models = (ENV.GEMINI_TEXT_MODELS || 'gemini-3.8-flash,gemini-3.6-flash').split(',').map((m) => m.trim()).filter(Boolean);
+  const extra = shorter ? `\nIMPORTANT: the last version was too long for ${Math.round(maxSecs)} seconds. Tell the SAME complete story (same ending and lesson) more tightly in at most ${Math.round(maxSecs * 2.1) - shorter * 15} spoken words.` : '';
+  const body = { contents: [{ parts: [{ text: scriptPrompt(topic) + extra }] }], generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 1.0 } };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (const m of models) {
+      const r = await gemini(m, body);
+      const txt = r.body?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('');
+      if (!r.ok || !txt) { log(`script ${m}: HTTP ${r.status}`); continue; }
+      try {
+        const g = JSON.parse(txt);
+        if (!Array.isArray(g.scenes) || g.scenes.length < 4 || !g.hook) throw new Error('bad shape');
+        g.scenes = g.scenes.filter((x) => x && x.hi && x.image);
+        s.gen = g; s.textModel = m;
+        log(`script OK (${m}): ${g.title} — ${g.scenes.length} scenes`);
+        return;
+      } catch (e) { log(`script ${m}: ${e.message}`); }
+    }
+    await sleep(5000);
+  }
+  throw new Error('Gemini script failed on every model');
+}
+
+// ---------- step 2: voice (Gemini TTS Charon, Kokoro fallback) ----------
+async function geminiTts(text, wav) {
+  const models = (ENV.TTS_MODELS || 'gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts-preview').split(',').map((m) => m.trim());
+  for (const m of models) {
+    const r = await gemini(m, {
+      contents: [{ parts: [{ text }] }], // only the story text: any style line gets read aloud
+      generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: ENV.TTS_VOICE || 'Charon' } } } },
+    });
+    const b64 = r.body?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!r.ok || !b64) { log(`tts ${m}: HTTP ${r.status} ${JSON.stringify(r.body?.error || '').slice(0, 160)}`); continue; }
+    const pcm = Buffer.from(b64, 'base64');
+    const raw = wav + '.pcm'; fs.writeFileSync(raw, pcm);
+    run('ffmpeg', ['-v', 'error', '-y', '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', raw, wav]);
+    fs.unlinkSync(raw);
+    return m;
+  }
+  return null;
+}
+async function stepVoice(s) {
+  const rd = runDir(s.runId);
+  const text = s.gen.scenes.map((x) => x.hi.trim()).join(' ');
+  fs.writeFileSync(path.join(rd, 'script.txt'), text, 'utf8');
+  const raw = path.join(rd, 'voice_raw.wav');
+  s.voiceEngine = await geminiTts(text, raw);
+  if (!s.voiceEngine) {
+    log('Gemini TTS failed on every model → Kokoro fallback');
+    run(PY, ['-X', 'utf8', '-I', path.join(__dirname, 'tts.py'), path.join(rd, 'script.txt'), raw, 'hm_psi', '0.95']);
+    s.voiceEngine = 'kokoro-hm_psi';
+  }
+  // trim edges, gentle clean-up and level; speed never changed
+  const voice = path.join(rd, 'voice.wav');
+  run('ffmpeg', ['-v', 'error', '-y', '-i', raw, '-af',
+    'silenceremove=start_periods=1:start_threshold=-45dB,areverse,silenceremove=start_periods=1:start_threshold=-45dB,areverse,'
+    + 'highpass=f=70,acompressor=threshold=-20dB:ratio=2.5:attack=10:release=150:makeup=2,loudnorm=I=-14:TP=-1.5:LRA=7,apad=pad_dur=0.6',
+    '-ar', '48000', '-ac', '1', voice]);
+  s.voiceDur = dur(voice);
+  log(`voice OK (${s.voiceEngine}): ${s.voiceDur.toFixed(1)} s`);
+  // word timings: faster-whisper small (my settings), then mapped onto the script's own words
+  const w16 = path.join(rd, 'voice16.wav'), wj = path.join(rd, 'words.json');
+  run('ffmpeg', ['-v', 'error', '-y', '-i', voice, '-ar', '16000', '-ac', '1', w16]);
+  let heard = [];
+  try { run(PY, ['-X', 'utf8', '-I', path.join(__dirname, 'transcribe.py'), w16, wj]); heard = JSON.parse(fs.readFileSync(wj, 'utf8')); }
+  catch (e) { log('transcribe failed, spreading words by length: ' + e.message.slice(0, 120)); }
+  s.timeline = alignScenes(s.gen.scenes, heard, s.voiceDur);
+}
+// Each script word gets the start time of the heard word at the same relative position (Whisper's
+// spelling of Hindi is unreliable, its count and timing are good). Roman words follow their scene's span.
+function alignScenes(scenes, heard, total) {
+  const hiWords = scenes.map((x) => x.hi.split(/\s+/).filter(Boolean));
+  const N = hiWords.reduce((a, w) => a + w.length, 0);
+  const starts = [];
+  if (heard.length >= N * 0.6) {
+    for (let i = 0; i < N; i++) starts.push(heard[Math.min(heard.length - 1, Math.round(i * heard.length / N))].s);
+  } else {
+    const all = hiWords.flat(), chars = all.reduce((a, w) => a + w.length + 1, 0); let t = 0.05;
+    for (const w of all) { starts.push(t); t += (total - 0.7) * (w.length + 1) / chars; }
+  }
+  const lastEnd = heard.length ? heard[heard.length - 1].e : total - 0.6;
+  let k = 0;
+  const out = scenes.map((sc, i) => {
+    const s0 = i === 0 ? 0 : starts[k]; k += hiWords[i].length;
+    return { start: s0, roman: sc.roman.split(/\s+/).filter(Boolean), image: sc.image };
+  });
+  out.forEach((sc, i) => { sc.end = i < out.length - 1 ? out[i + 1].start : total; });
+  // roman words: spread inside the scene's speech span by length
+  out.forEach((sc, i) => {
+    const speechEnd = i < out.length - 1 ? sc.end : Math.min(total, lastEnd + 0.1);
+    const chars = sc.roman.reduce((a, w) => a + w.length + 1, 0);
+    let t = sc.start + (i === 0 ? 0.05 : 0);
+    const span = speechEnd - t;
+    sc.words = sc.roman.map((w) => { const d = span * (w.length + 1) / Math.max(1, chars); const o = { w, s: t, e: t + d }; t += d; return o; });
+  });
+  return out;
+}
+
+// ---------- step 3: images (Cloudflare FLUX.2 klein 4B, Apache-2.0) ----------
+async function cfImage(prompt, file) {
+  const fd = new FormData();
+  fd.append('prompt', `${prompt}. ${STYLE}`); fd.append('width', '1024'); fd.append('height', '1024');
+  const r = await httpJson(`https://api.cloudflare.com/client/v4/accounts/${ENV.CLOUDFLARE_ACCOUNT_ID}/ai/run/${CF_MODEL}`,
+    { method: 'POST', headers: { Authorization: 'Bearer ' + ENV.CLOUDFLARE_API_TOKEN }, body: fd }, 180000);
+  const img = r.body?.result?.image;
+  if (!r.ok || !img) throw new Error(`HTTP ${r.status} ${JSON.stringify(r.body?.errors || r.body).slice(0, 200)}`);
+  fs.writeFileSync(file, Buffer.from(img, 'base64'));
+}
+const softPrompt = (p) => p.replace(/\b(blood\w*|dead|death|die\w*|kill\w*|corpse|body|weapon|gun|knife|naked|nude|suicide|hang\w*|fight\w*|beat\w*|violence|violent|drunk|alcohol)\b/gi, '')
+  .replace(/\s{2,}/g, ' ') + ', gentle and family-friendly';
+async function stepImages(s) {
+  const rd = runDir(s.runId);
+  for (const [i, sc] of s.timeline.entries()) {
+    sc.file = path.join(rd, `img${i}.png`);
+    if (fs.existsSync(sc.file)) continue;
+    // a prompt flagged by the safety filter (code 3030) is softened, then replaced by a calm generic scene
+    // our doodle style always wins over style words Gemini adds ("realistic style" made FLUX flag scenes, 2026-11-01)
+    const base = sc.image.replace(/,?\s*\b(hyper)?realistic( style)?|photo\w*|cinematic|named \w+/gi, '').trim();
+    const prompts = [base, softPrompt(base), 'a stick-figure person sitting quietly under a tree at sunset, thoughtful mood'];
+    for (let a = 0; ; a++) {
+      try { await cfImage(prompts[Math.min(a, prompts.length - 1)], sc.file); break; } catch (e) {
+        log(`image ${i} try ${a + 1}: ${e.message.slice(0, 160)}`);
+        if (a >= 3) throw e; await sleep(4000);
+      }
+    }
+  }
+  log(`images OK: ${s.timeline.length}`);
+}
+
+// ---------- step 4: render (FFmpeg) ----------
+const assTime = (t) => { const cs = Math.max(0, Math.round(t * 100)); return `${Math.floor(cs / 360000)}:${String(Math.floor(cs / 6000) % 60).padStart(2, '0')}:${String(Math.floor(cs / 100) % 60).padStart(2, '0')}.${String(cs % 100).padStart(2, '0')}`; };
+const assEsc = (x) => String(x).replace(/[{}\\]/g, '').trim();
+function buildAss(s) {
+  const YEL = '&H0026D9FF&', WHT = '&H00FFFFFF&', total = s.voiceDur;
+  const hl = (s.gen.hook.highlight || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const hookLine = (l) => assEsc(l).split(/\s+/).map((w) => (w.toLowerCase().replace(/[^a-z0-9]/g, '') === hl && hl ? `{\\c${YEL}}${w}{\\c${WHT}}` : w)).join(' ');
+  const ev = [`Dialogue: 1,${assTime(0)},${assTime(total)},Hook,,0,0,0,,${hookLine(s.gen.hook.line1)}\\N${hookLine(s.gen.hook.line2)}`];
+  ev.push(`Dialogue: 1,${assTime(0)},${assTime(total)},Mark,,0,0,0,,${assEsc(ENV.WATERMARK || '@zindagikasach')}`);
+  // subtitles: 2-4 words a line under the picture, the spoken word pops yellow and a bit bigger
+  for (const sc of s.timeline) {
+    const chunks = []; let cur = [];
+    for (const w of sc.words) { cur.push(w); if (cur.length >= 3 || cur.map((x) => x.w).join(' ').length >= 18 || /[.?!,]$/.test(w.w)) { chunks.push(cur); cur = []; } }
+    if (cur.length) chunks.push(cur);
+    chunks.forEach((c) => c.forEach((w, wi) => {
+      const en = wi < c.length - 1 ? c[wi + 1].s : c[c.length - 1].e;
+      const txt = c.map((x, xi) => (xi === wi ? `{\\c${YEL}\\fscx112\\fscy112}${assEsc(x.w)}{\\c${WHT}\\fscx100\\fscy100}` : assEsc(x.w))).join(' ');
+      ev.push(`Dialogue: 0,${assTime(w.s)},${assTime(Math.max(en, w.s + 0.06))},Sub,,0,0,0,,${txt}`);
+    }));
+  }
+  return `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${W}
+PlayResY: ${H}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Hook,Poppins Black,66,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,70,70,${IMG_Y - 190},1
+Style: Sub,Poppins Black,64,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,2,8,60,60,${IMG_Y + IMG + 50},1
+Style: Mark,Poppins Black,30,&H70FFFFFF,&H70FFFFFF,&H90000000,&H00000000,0,0,0,0,100,100,1,0,1,1,0,2,0,0,${H - IMG_Y - IMG + 24},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+${ev.join('\n')}
+`;
+}
+function stepRender(s) {
+  const rd = runDir(s.runId);
+  fs.writeFileSync(path.join(rd, 'subs.ass'), buildAss(s), 'utf8');
+  const tracks = fs.readdirSync(DIR.music).filter((f) => /\.mp3$/i.test(f));
+  s.music = tracks.length ? tracks[Math.floor(Math.random() * tracks.length)] : null;
+  // scene clips: whole frames only; image slowly pushes in, then cuts to the next
+  const parts = [];
+  let used = 0;
+  s.timeline.forEach((sc, i) => {
+    const endF = i < s.timeline.length - 1 ? Math.round(sc.end * FPS) : Math.ceil(s.voiceDur * FPS);
+    const nf = Math.max(6, endF - used); used += nf;
+    const clip = path.join(rd, `clip${i}.mp4`);
+    const z = i % 2 ? `1.08-0.08*on/${nf}` : `1+0.08*on/${nf}`;
+    run('ffmpeg', ['-v', 'error', '-y', '-loop', '1', '-i', sc.file, '-vf',
+      `scale=${IMG * 2}:${IMG * 2},zoompan=z='${z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${nf}:s=${IMG}x${IMG}:fps=${FPS},`
+      + `pad=${W}:${H}:${IMG_X}:${IMG_Y}:black,format=yuv420p,setsar=1,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv`,
+      '-frames:v', String(nf), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-r', String(FPS), clip]);
+    parts.push(clip);
+  });
+  const list = path.join(rd, 'clips.txt');
+  fs.writeFileSync(list, parts.map((p) => `file '${p.replace(/\\/g, '/')}'`).join('\n'));
+  const silent = path.join(rd, 'silent.mp4');
+  run('ffmpeg', ['-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', silent]);
+  // relative paths for the subtitles filter (Windows drive colons break it)
+  const rel = (p) => path.relative(process.cwd(), p).replace(/\\/g, '/');
+  const out = path.join(DIR.output, `ZKS_${s.runId}.mp4`);
+  const vol = ENV.MUSIC_VOLUME || '0.14';
+  const args = ['-v', 'error', '-y', '-i', silent, '-i', path.join(rd, 'voice.wav')];
+  let af;
+  if (s.music) {
+    args.push('-stream_loop', '-1', '-i', path.join(DIR.music, s.music));
+    af = `[2:a]volume=${vol},afade=t=in:d=0.8,afade=t=out:st=${(s.voiceDur - 1.2).toFixed(2)}:d=1.2[m];[1:a][m]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:level=false[a]`;
+  } else af = '[1:a]anull[a]';
+  args.push('-filter_complex', `[0:v]subtitles='${rel(path.join(rd, 'subs.ass'))}':fontsdir='${rel(DIR.fonts)}'[v];${af}`,
+    '-map', '[v]', '-map', '[a]', '-t', s.voiceDur.toFixed(3), '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-movflags', '+faststart', out + '.tmp.mp4');
+  run('ffmpeg', args);
+  fs.renameSync(out + '.tmp.mp4', out);
+  s.output = out;
+  log(`render OK: ${path.basename(out)} (${dur(out).toFixed(1)} s, music: ${s.music || 'none'})`);
+}
+
+// ---------- step 5: post (Facebook Reels API) ----------
+const caption = (g) => `${g.title}\n\n${g.caption}\n\n${[...new Set([...(g.hashtags || []), ...(ENV.FIXED_HASHTAGS || '').split(/\s+/)].filter((h) => /^#\S+$/.test(h)))].join(' ')}`;
+// Publishing code and its safeguards come from the Infax pipeline (tested there 2026-10-27..31).
+const GRAPH = 'https://graph.facebook.com/v26.0';
+const IG_MAX = 44.5; // Instagram API reels fail above ~45 s (Infax lesson); Instagram is off for this page
+const FB_MAX = 88; // Facebook Reels API takes 3-90 s; the story is never cut, only retold tighter
+function need(...keys) { const m = keys.filter((k) => !ENV[k]); if (m.length) throw new Error('Missing setting: ' + m.join(', ')); }
+// last check before anything goes public: never post a broken reel
+function preflight(s) {
+  if (!s.output || !fs.existsSync(s.output)) throw new Error('preflight: no rendered file');
+  const p = JSON.parse(run('ffprobe', ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', s.output]));
+  const v = p.streams.find((x) => x.codec_type === 'video'), a = p.streams.find((x) => x.codec_type === 'audio');
+  const secs = parseFloat(p.format.duration);
+  const bad = [];
+  if (!v || v.width !== W || v.height !== H) bad.push('video not 1080x1920');
+  if (!a) bad.push('no audio');
+  if (!(secs >= 12 && secs <= 90)) bad.push(`length ${secs.toFixed(1)} s`);
+  if (Math.abs(secs - s.voiceDur) > 0.5) bad.push('video/voice length differ');
+  if (s.timeline.some((sc) => !fs.existsSync(sc.file))) bad.push('missing image');
+  if (bad.length) throw new Error('preflight: ' + bad.join(', '));
+  return secs;
+}
+async function publishFacebook(s) {
+  need('FB_PAGE_ID', 'FB_PAGE_ACCESS_TOKEN');
+  const tok = ENV.FB_PAGE_ACCESS_TOKEN, page = ENV.FB_PAGE_ID;
+  const start = await httpJson(`${GRAPH}/${page}/video_reels`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upload_phase: 'start', access_token: tok }) }, 60000);
+  if (!start.ok || !start.body.video_id) throw new Error('FB start failed: ' + JSON.stringify(start.body).slice(0, 300));
+  const videoId = start.body.video_id, size = fs.statSync(s.output).size;
+  const up = await httpJson(`https://rupload.facebook.com/video-upload/v26.0/${videoId}`, { method: 'POST', body: fs.readFileSync(s.output),
+    headers: { Authorization: 'OAuth ' + tok, offset: '0', file_size: String(size), 'Content-Type': 'application/octet-stream' } }, 600000);
+  if (!up.ok || !up.body.success) throw new Error('FB upload failed: ' + JSON.stringify(up.body).slice(0, 300));
+  const fin = await httpJson(`${GRAPH}/${page}/video_reels`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upload_phase: 'finish', video_id: videoId, video_state: 'PUBLISHED', title: s.gen.title.slice(0, 100), description: caption(s.gen), is_ai_generated: true, access_token: tok }) }, 120000);
+  // from here the reel is public: nothing below may throw into a retry (no double posts)
+  if (!fin.ok || !fin.body.success) throw Object.assign(new Error('FB publish failed: ' + JSON.stringify(fin.body).slice(0, 300)), { maybePosted: true });
+  let link = null;
+  for (let k = 0; k < 60 && !link; k++) {
+    await sleep(10000);
+    const st = await httpJson(`${GRAPH}/${videoId}?fields=status,permalink_url&access_token=${encodeURIComponent(tok)}`, {}, 30000);
+    const vs = st.body.status || {};
+    if (vs.video_status === 'error') { log('FB processing error: ' + JSON.stringify(vs).slice(0, 200)); break; }
+    if (vs.publishing_phase?.status === 'complete' || vs.video_status === 'ready') link = st.body.permalink_url;
+  }
+  return link ? (link.startsWith('http') ? link : 'https://www.facebook.com' + link) : `https://www.facebook.com/reel/${videoId}`;
+}
+async function instagramOnce(s) {
+  const tok = ENV.FB_PAGE_ACCESS_TOKEN, ig = ENV.IG_USER_ID;
+  const c = await httpJson(`${GRAPH}/${ig}/media`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ media_type: 'REELS', upload_type: 'resumable', caption: caption(s.gen).slice(0, 2200), share_to_feed: true, thumb_offset: 500, access_token: tok }) }, 60000);
+  if (!c.ok || !c.body.id) throw new Error('IG container failed: ' + JSON.stringify(c.body).slice(0, 300));
+  const id = c.body.id;
+  const up = await httpJson(`https://rupload.facebook.com/ig-api-upload/v26.0/${id}`, { method: 'POST', body: fs.readFileSync(s.output),
+    headers: { Authorization: 'OAuth ' + tok, offset: '0', file_size: String(fs.statSync(s.output).size) } }, 600000);
+  if (!up.ok || !up.body.success) throw new Error('IG upload failed: ' + JSON.stringify(up.body).slice(0, 300));
+  let st = '';
+  for (let k = 0; k < 40 && st !== 'FINISHED'; k++) {
+    await sleep(15000);
+    st = (await httpJson(`${GRAPH}/${id}?fields=status_code&access_token=${encodeURIComponent(tok)}`, {}, 30000)).body.status_code || '';
+    if (st === 'ERROR' || st === 'EXPIRED') throw new Error('IG processing ' + st);
+  }
+  if (st !== 'FINISHED') throw new Error('IG processing did not finish in 10 min');
+  const pub = await httpJson(`${GRAPH}/${ig}/media_publish`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ creation_id: id, access_token: tok }) }, 120000);
+  if (!pub.ok || !pub.body.id) throw Object.assign(new Error('IG publish failed: ' + JSON.stringify(pub.body).slice(0, 300)), { maybePosted: true });
+  const pl = (await httpJson(`${GRAPH}/${pub.body.id}?fields=permalink&access_token=${encodeURIComponent(tok)}`, {}, 30000)).body.permalink;
+  return pl || 'https://www.instagram.com/';
+}
+async function publishInstagram(s, secs) {
+  need('FB_PAGE_ACCESS_TOKEN', 'IG_USER_ID');
+  if (secs > IG_MAX) throw new Error(`reel is ${secs.toFixed(1)} s; Instagram API takes up to ~45 s`);
+  // IG's upload server fails at random: up to 4 tries with a fresh container, never after a publish call
+  for (let a = 1; ; a++) {
+    try { return await instagramOnce(s); } catch (e) {
+      if (a >= 4 || e.maybePosted || !/IG (container|upload|processing)/.test(e.message)) throw e;
+      log(`instagram try ${a} failed (${e.message.slice(0, 90)}), retry in ${a * 45} s`); await sleep(a * 45000);
+    }
+  }
+}
+// ---------- YouTube Shorts (code from Infax, live there since 2026-10-28) ----------
+async function youtubeToken() {
+  need('YT_CLIENT_ID', 'YT_CLIENT_SECRET', 'YT_REFRESH_TOKEN');
+  const r = await httpJson('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: ENV.YT_CLIENT_ID, client_secret: ENV.YT_CLIENT_SECRET, refresh_token: ENV.YT_REFRESH_TOKEN, grant_type: 'refresh_token' }) }, 30000);
+  if (!r.ok || !r.body.access_token) throw new Error('YouTube token refresh failed: ' + JSON.stringify(r.body).slice(0, 200));
+  return r.body.access_token;
+}
+async function publishYouTube(s) {
+  const tok = await youtubeToken();
+  const g = s.gen, tags = (g.hashtags || []).map((h) => h.replace(/^#/, ''));
+  const meta = {
+    snippet: { title: g.title.replace(/[<>]/g, '').slice(0, 100), description: `${g.caption}\n\n${(g.hashtags || []).join(' ')} #Shorts`.replace(/[<>]/g, '').slice(0, 4900),
+      tags: tags.slice(0, 15), categoryId: ENV.YT_CATEGORY || '22', defaultLanguage: 'hi', defaultAudioLanguage: 'hi' },
+    status: { privacyStatus: ENV.YT_PRIVACY || 'private', selfDeclaredMadeForKids: false, containsSyntheticMedia: true },
+  };
+  const size = fs.statSync(s.output).size;
+  const init = await fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', { method: 'POST', body: JSON.stringify(meta),
+    headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': 'video/mp4', 'X-Upload-Content-Length': String(size) },
+    signal: AbortSignal.timeout(60000) });
+  const loc = init.headers.get('location');
+  if (!init.ok || !loc) throw new Error(`YouTube upload start failed: HTTP ${init.status} ${(await init.text()).slice(0, 200)}`);
+  const up = await httpJson(loc, { method: 'PUT', headers: { 'Content-Type': 'video/mp4' }, body: fs.readFileSync(s.output) }, 600000);
+  if (!up.ok || !up.body.id) throw new Error('YouTube upload failed: ' + JSON.stringify(up.body).slice(0, 200));
+  return `https://youtube.com/shorts/${up.body.id}`;
+}
+// YouTube gets ONE reel a day (mass-produced policy): only the run at a YT_HOURS hour (IST) uploads
+const ytSlot = () => (ENV.YT_HOURS || '18').split(',').map(Number).includes(new Date(Date.now() + 5.5 * 3600e3).getUTCHours());
+async function stepPost(s) {
+  const secs = preflight(s);
+  if (!/^true$/i.test(ENV.POST_ENABLED || '')) { log('POST_ENABLED is not true → not posted (dry run)'); s.posted = { fb: 'dry-run' }; return; }
+  s.posted = s.posted || {};
+  if (!s.posted.fb) { s.posted.fb = await publishFacebook(s); saveState(s); log('facebook posted: ' + s.posted.fb); }
+  // Instagram is a separate step: its failure never blocks or repeats the Facebook post (new features default OFF)
+  if (/^true$/i.test(ENV.IG_ENABLED || '') && !s.posted.ig) {
+    try { s.posted.ig = await publishInstagram(s, secs); log('instagram posted: ' + s.posted.ig); }
+    catch (e) { s.posted.ig = '❌ ' + e.message.slice(0, 120); log('instagram failed: ' + e.message); }
+  }
+  if (/^true$/i.test(ENV.YT_ENABLED || '') && !s.posted.yt && (ytSlot() || process.env.FORCE_YT === 'true')) {
+    try { s.posted.yt = await publishYouTube(s); log('youtube posted: ' + s.posted.yt); }
+    catch (e) { s.posted.yt = '❌ ' + e.message.slice(0, 120); log('youtube failed: ' + e.message); }
+  }
+  fs.appendFileSync(path.join(DIR.logs, 'posts.csv'), `"${s.runId}","${s.gen.title.replace(/"/g, '""')}","${s.posted.fb}","${s.posted.yt || ''}"\n`, 'utf8');
+}
+
+// ---------- main ----------
+async function make(topic) {
+  for (const d of Object.values(DIR)) fs.mkdirSync(d, { recursive: true });
+  const s = { runId: istStamp().id, date: istStamp().date };
+  RUN = s.runId; fs.mkdirSync(runDir(s.runId), { recursive: true });
+  // the whole story must fit Facebook's 90 s limit: a too-long one is retold tighter (still complete), max 2 times
+  const maxSecs = /^true$/i.test(ENV.IG_ENABLED || '') ? IG_MAX : FB_MAX;
+  for (let k = 0; ; k++) {
+    await stepScript(s, topic, k, maxSecs); saveState(s);
+    await stepVoice(s); saveState(s);
+    if (s.voiceDur <= maxSecs) break;
+    if (k >= 2) throw new Error(`story still ${s.voiceDur.toFixed(1)} s after 2 rewrites`);
+    log(`voice ${s.voiceDur.toFixed(1)} s is over ${maxSecs} s → retelling tighter`);
+  }
+  await stepImages(s); saveState(s);
+  stepRender(s); saveState(s);
+  fs.appendFileSync(path.join(DIR.logs, 'used-topics.txt'), s.gen.topic + '\n', 'utf8');
+  fs.writeFileSync(path.join(DIR.output, `ZKS_${s.runId}.txt`), caption(s.gen), 'utf8');
+  return s;
+}
+(async () => {
+  const [cmd, arg] = process.argv.slice(2);
+  try {
+    if (cmd === 'make') { const s = await make(arg); console.log(JSON.stringify({ runId: s.runId, output: s.output })); }
+    else if (cmd === 'resume') { // finish a failed run from its images (script + voice kept)
+      RUN = arg; const s = loadState(arg); await stepImages(s); saveState(s); stepRender(s); saveState(s);
+      fs.appendFileSync(path.join(DIR.logs, 'used-topics.txt'), s.gen.topic + '\n', 'utf8');
+      fs.writeFileSync(path.join(DIR.output, `ZKS_${s.runId}.txt`), caption(s.gen), 'utf8');
+      console.log(JSON.stringify({ runId: s.runId, output: s.output }));
+    } else if (cmd === 'yttest') { // private test upload of a rendered run
+      RUN = arg; const s = loadState(arg); preflight(s); ENV.YT_PRIVACY = 'private';
+      console.log('youtube (private): ' + await publishYouTube(s));
+    } else if (cmd === 'post') { RUN = arg; const s = loadState(arg); await stepPost(s); saveState(s); }
+    else if (cmd === 'all') { const s = await make(arg); await stepPost(s); saveState(s); }
+    else { console.error('usage: node zks.js make [topic] | post <runId> | all'); process.exit(2); }
+  } catch (e) { log('FAILED: ' + e.message); process.exit(1); }
+})();
