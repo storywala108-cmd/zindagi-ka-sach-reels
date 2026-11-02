@@ -583,6 +583,8 @@ async function make(topic) {
       console.log(JSON.stringify({ runId: s.runId, output: s.output }));
     } else if (cmd === 'igtest') { // build only the Instagram copy of a rendered run (no upload)
       RUN = arg; const s = loadState(arg); console.log(makeInstagramVersion(s));
+    } else if (cmd === 'igpost') { // publish one rendered run to Instagram only (first real-path test)
+      RUN = arg; const s = loadState(arg); preflight(s); console.log('instagram: ' + await publishInstagram(s));
     } else if (cmd === 'yttest') { // private test upload of a rendered run
       RUN = arg; const s = loadState(arg); preflight(s); ENV.YT_PRIVACY = 'private';
       console.log('youtube (private): ' + await publishYouTube(s));
