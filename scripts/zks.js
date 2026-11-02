@@ -125,8 +125,20 @@ async function stepScript(s, topic, shorter = 0, maxSecs = 88) {
   throw new Error('Gemini script failed on every model');
 }
 
-// ---------- step 2: voice (Gemini TTS Charon, Kokoro fallback) ----------
+// ---------- step 2: voice (always Gemini TTS Charon) ----------
+// My reels must always have the Charon voice (2026-11-02: Gemini was busy with 503s at 6 PM and the Kokoro fallback
+// changed the voice). So: keep retrying every model for up to ~TTS_ROUNDS rounds, 90 s apart; if Charon still can't
+// be had, the run stops without posting (the next scheduled run tries again). Kokoro only if TTS_FALLBACK=kokoro.
 async function geminiTts(text, wav) {
+  const rounds = parseInt(ENV.TTS_ROUNDS || '10', 10);
+  for (let k = 1; k <= rounds; k++) {
+    const m = await geminiTtsOnce(text, wav);
+    if (m) return m;
+    if (k < rounds) { log(`tts round ${k}/${rounds} failed, waiting 90 s`); await sleep(90000); }
+  }
+  return null;
+}
+async function geminiTtsOnce(text, wav) {
   const models = (ENV.TTS_MODELS || 'gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts-preview').split(',').map((m) => m.trim());
   for (const m of models) {
     const r = await gemini(m, {
@@ -150,7 +162,8 @@ async function stepVoice(s) {
   const raw = path.join(rd, 'voice_raw.wav');
   s.voiceEngine = await geminiTts(text, raw);
   if (!s.voiceEngine) {
-    log('Gemini TTS failed on every model → Kokoro fallback');
+    if (!/^kokoro$/i.test(ENV.TTS_FALLBACK || '')) throw new Error('Charon voice unavailable (Gemini TTS busy) → not posting this run');
+    log('Gemini TTS failed on every model → Kokoro fallback (TTS_FALLBACK=kokoro)');
     run(PY, ['-X', 'utf8', '-I', path.join(__dirname, 'tts.py'), path.join(rd, 'script.txt'), raw, 'hm_psi', '0.95']);
     s.voiceEngine = 'kokoro-hm_psi';
   }

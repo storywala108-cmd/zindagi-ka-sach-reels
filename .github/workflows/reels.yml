@@ -31,7 +31,7 @@ jobs:
     # pause switch: repository variable AUTO_POST=off stops scheduled runs; hand-started runs always go
     if: github.event_name != 'schedule' || vars.AUTO_POST != 'off'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
