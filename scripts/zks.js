@@ -257,18 +257,14 @@ async function stepImages(s) {
 // ---------- step 4: render (FFmpeg) ----------
 const assTime = (t) => { const cs = Math.max(0, Math.round(t * 100)); return `${Math.floor(cs / 360000)}:${String(Math.floor(cs / 6000) % 60).padStart(2, '0')}:${String(Math.floor(cs / 100) % 60).padStart(2, '0')}.${String(cs % 100).padStart(2, '0')}`; };
 const assEsc = (x) => String(x).replace(/[{}\\]/g, '').trim();
-// all three handles in the old watermark style (asked 2026-11-02), two lines so they fit the 1080 px width
-function handlesMark() {
-  const fb = ENV.FB_HANDLE || 'zindagikasach.kahani', yt = ENV.YT_HANDLE || '@zindagikasach.kahani';
-  const ig = ENV.IG_HANDLE || '@' + (ENV.IG_USERNAME || 'zindagi_ka_sach8');
-  return `${assEsc(`FB: ${fb}  ·  YT: ${yt}`)}\\N${assEsc(`IG: ${ig}`)}`;
-}
+// FB / YouTube / Instagram logos + handles at the old watermark spot (asked 2026-11-02): a ready-made transparent
+// strip (brand/handles.png, rebuilt by brand/src/handles.js when a handle changes), overlaid on reel and cover
+const HANDLES_PNG = path.join(ROOT, 'brand', 'handles.png');
 function buildAss(s) {
   const YEL = '&H0026D9FF&', WHT = '&H00FFFFFF&', total = s.voiceDur;
   const hl = (s.gen.hook.highlight || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const hookLine = (l) => assEsc(l).split(/\s+/).map((w) => (w.toLowerCase().replace(/[^a-z0-9]/g, '') === hl && hl ? `{\\c${YEL}}${w}{\\c${WHT}}` : w)).join(' ');
   const ev = [`Dialogue: 1,${assTime(0)},${assTime(total)},Hook,,0,0,0,,${hookLine(s.gen.hook.line1)}\\N${hookLine(s.gen.hook.line2)}`];
-  ev.push(`Dialogue: 1,${assTime(0)},${assTime(total)},Mark,,0,0,0,,${handlesMark()}`);
   // subtitles: 2-4 words a line under the picture, the spoken word pops yellow and a bit bigger
   for (const sc of s.timeline) {
     const chunks = []; let cur = [];
@@ -331,7 +327,10 @@ function stepRender(s) {
     args.push('-stream_loop', '-1', '-i', path.join(DIR.music, s.music));
     af = `[2:a]volume=${vol},afade=t=in:d=0.8,afade=t=out:st=${(s.voiceDur - 1.2).toFixed(2)}:d=1.2[m];[1:a][m]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:level=false,afade=t=out:st=${(s.voiceDur - 0.35).toFixed(2)}:d=0.35[a]`;
   } else af = `[1:a]afade=t=out:st=${(s.voiceDur - 0.35).toFixed(2)}:d=0.35[a]`;
-  args.push('-filter_complex', `[0:v]subtitles='${rel(path.join(rd, 'subs.ass'))}':fontsdir='${rel(DIR.fonts)}'[v];${af}`,
+  const hIdx = s.music ? 3 : 2;
+  args.push('-i', HANDLES_PNG);
+  args.push('-filter_complex', `[0:v]subtitles='${rel(path.join(rd, 'subs.ass'))}':fontsdir='${rel(DIR.fonts)}'[sv];`
+    + `[sv][${hIdx}:v]overlay=(W-w)/2:${IMG_Y + IMG - 104}[v];${af}`,
     '-map', '[v]', '-map', '[a]', '-t', s.voiceDur.toFixed(3), '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-movflags', '+faststart', out + '.tmp.mp4');
   const body = path.join(rd, 'body.mp4');
@@ -378,12 +377,13 @@ Style: M,Poppins Black,28,&H30FFFFFF,&H30FFFFFF,&H50000000,&H00000000,0,0,0,0,10
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.00,0:00:05.00,T,,0,0,0,,${line(h.line1)}\\N${line(h.line2)}
-Dialogue: 0,0:00:00.00,0:00:05.00,M,,0,0,0,,${handlesMark()}
 `, 'utf8');
   const rel = (p) => path.relative(process.cwd(), p).replace(/\\/g, '/');
-  run('ffmpeg', ['-v', 'error', '-y', '-i', img, '-filter_complex',
+  run('ffmpeg', ['-v', 'error', '-y', '-i', img, '-i', HANDLES_PNG, '-filter_complex',
     `[0]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=30,eq=brightness=-0.28[bg];`
-    + `[0]scale=860:860[fg];[bg][fg]overlay=(W-w)/2:720,subtitles='${rel(ass)}':fontsdir='${rel(DIR.fonts)}'`,
+    // painting y 680-1540, logo strip 1545-1635: both end inside the 4:5 grid crop (y 285-1635)
+    + `[0]scale=860:860[fg];[bg][fg]overlay=(W-w)/2:680,subtitles='${rel(ass)}':fontsdir='${rel(DIR.fonts)}'[t];`
+    + `[t][1:v]overlay=(W-w)/2:1545`,
     '-frames:v', '1', s.thumb]);
 }
 
