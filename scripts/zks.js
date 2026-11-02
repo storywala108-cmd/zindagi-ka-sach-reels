@@ -155,11 +155,24 @@ async function stepVoice(s) {
     s.voiceEngine = 'kokoro-hm_psi';
   }
   // trim edges, gentle clean-up and level; speed never changed
-  const voice = path.join(rd, 'voice.wav');
+  // the TTS tail has a faint hiss that loudnorm pumped into a "shhh" at the end (2026-11-02): trim again after
+  // loudnorm, then a short fade before the silent pad
+  const voice = path.join(rd, 'voice.wav'), trimmed = path.join(rd, 'voice_trim.wav');
+  const trim = (db) => `silenceremove=start_periods=1:start_threshold=${db}dB:start_silence=0.05,areverse,silenceremove=start_periods=1:start_threshold=${db}dB:start_silence=0.08,areverse`;
   run('ffmpeg', ['-v', 'error', '-y', '-i', raw, '-af',
-    'silenceremove=start_periods=1:start_threshold=-45dB,areverse,silenceremove=start_periods=1:start_threshold=-45dB,areverse,'
-    + 'highpass=f=70,acompressor=threshold=-20dB:ratio=2.5:attack=10:release=150:makeup=2,loudnorm=I=-14:TP=-1.5:LRA=7,apad=pad_dur=0.6',
-    '-ar', '48000', '-ac', '1', voice]);
+    `${trim(-38)},highpass=f=70,acompressor=threshold=-20dB:ratio=2.5:attack=10:release=150:makeup=2,loudnorm=I=-14:TP=-1.5:LRA=7,${trim(-36)}`,
+    '-ar', '48000', '-ac', '1', trimmed]);
+  // the TTS often adds a lone noise burst ~0.3 s after the last word: drop anything shorter than 0.6 s that comes
+  // after the final pause
+  let td = dur(trimmed);
+  const sd = spawnSync('ffmpeg', ['-hide_banner', '-i', trimmed, '-af', 'silencedetect=n=-45dB:d=0.2', '-f', 'null', '-'], { encoding: 'utf8' }).stderr || '';
+  const lastStart = [...sd.matchAll(/silence_start: ([\d.]+)/g)].map((m) => parseFloat(m[1])).pop();
+  if (lastStart && td - lastStart < 0.9 && lastStart > td * 0.8) {
+    const tmp = trimmed.replace(/\.wav$/, '_cut.wav');
+    run('ffmpeg', ['-v', 'error', '-y', '-i', trimmed, '-t', lastStart.toFixed(3), tmp]);
+    fs.renameSync(tmp, trimmed); log(`voice: dropped ${(td - lastStart).toFixed(2)} s tail noise`); td = dur(trimmed);
+  }
+  run('ffmpeg', ['-v', 'error', '-y', '-i', trimmed, '-af', `afade=t=out:st=${Math.max(0, td - 0.15).toFixed(3)}:d=0.15,apad=pad_dur=0.6`, voice]);
   s.voiceDur = dur(voice);
   log(`voice OK (${s.voiceEngine}): ${s.voiceDur.toFixed(1)} s`);
   // word timings: faster-whisper small (my settings), then mapped onto the script's own words
@@ -177,7 +190,17 @@ function alignScenes(scenes, heard, total) {
   const N = hiWords.reduce((a, w) => a + w.length, 0);
   const starts = [];
   if (heard.length >= N * 0.6) {
-    for (let i = 0; i < N; i++) starts.push(heard[Math.min(heard.length - 1, Math.round(i * heard.length / N))].s);
+    // match by spoken-text position (share of characters), not word index: Whisper splits Hindi words differently,
+    // and index matching drifted one scene to 16 s (2026-11-02)
+    const all = hiWords.flat(), tot = all.reduce((a, w) => a + w.length, 0);
+    const hc = []; let c = 0;
+    for (const h of heard) { hc.push(c); c += h.w.length; }
+    let acc = 0, j = 0;
+    for (const w of all) {
+      const target = (acc / tot) * c;
+      while (j < heard.length - 1 && hc[j + 1] <= target) j++;
+      starts.push(heard[j].s); acc += w.length;
+    }
   } else {
     const all = hiWords.flat(), chars = all.reduce((a, w) => a + w.length + 1, 0); let t = 0.05;
     for (const w of all) { starts.push(t); t += (total - 0.7) * (w.length + 1) / chars; }
@@ -300,15 +323,62 @@ function stepRender(s) {
   let af;
   if (s.music) {
     args.push('-stream_loop', '-1', '-i', path.join(DIR.music, s.music));
-    af = `[2:a]volume=${vol},afade=t=in:d=0.8,afade=t=out:st=${(s.voiceDur - 1.2).toFixed(2)}:d=1.2[m];[1:a][m]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:level=false[a]`;
-  } else af = '[1:a]anull[a]';
+    af = `[2:a]volume=${vol},afade=t=in:d=0.8,afade=t=out:st=${(s.voiceDur - 1.2).toFixed(2)}:d=1.2[m];[1:a][m]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:level=false,afade=t=out:st=${(s.voiceDur - 0.35).toFixed(2)}:d=0.35[a]`;
+  } else af = `[1:a]afade=t=out:st=${(s.voiceDur - 0.35).toFixed(2)}:d=0.35[a]`;
   args.push('-filter_complex', `[0:v]subtitles='${rel(path.join(rd, 'subs.ass'))}':fontsdir='${rel(DIR.fonts)}'[v];${af}`,
     '-map', '[v]', '-map', '[a]', '-t', s.voiceDur.toFixed(3), '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-movflags', '+faststart', out + '.tmp.mp4');
+  const body = path.join(rd, 'body.mp4');
+  args[args.length - 1] = body;
   run('ffmpeg', args);
+  // thumbnail card: the reel opens on it for THUMB_SECS, and it is uploaded as the custom cover everywhere
+  s.thumb = path.join(DIR.output, `ZKS_${s.runId}_thumb.png`);
+  makeThumbnail(s, rd);
+  run('ffmpeg', ['-v', 'error', '-y', '-loop', '1', '-t', String(THUMB_SECS), '-framerate', String(FPS), '-i', s.thumb,
+    '-f', 'lavfi', '-t', String(THUMB_SECS), '-i', 'anullsrc=r=48000:cl=stereo', '-i', body, '-filter_complex',
+    '[0:v]scale=1080:1920,setsar=1,format=yuv420p,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv[tv];'
+    + '[2:v]setsar=1[bv];[2:a]aformat=sample_rates=48000:channel_layouts=stereo[ba];[tv][1:a][bv][ba]concat=n=2:v=1:a=1[v][a]',
+    '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p', '-r', String(FPS),
+    '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', out + '.tmp.mp4']);
   fs.renameSync(out + '.tmp.mp4', out);
   s.output = out;
-  log(`render OK: ${path.basename(out)} (${dur(out).toFixed(1)} s, music: ${s.music || 'none'})`);
+  s.videoDur = dur(out);
+  log(`render OK: ${path.basename(out)} (${s.videoDur.toFixed(1)} s incl. ${THUMB_SECS} s cover, music: ${s.music || 'none'})`);
+}
+const THUMB_SECS = 0.6;
+// Cover: blurred scene-1 painting fills the frame, the sharp painting sits in the middle, the hook on top.
+// Every word stays inside the 4:5 centre (y 285-1635) that Facebook/Instagram grids show: libass wraps the hook
+// inside 90 px side margins and the font shrinks for long hooks, so text can never leave the frame.
+function makeThumbnail(s, rd) {
+  const img = s.timeline[0].file, h = s.gen.hook;
+  const longest = Math.max(h.line1.length, h.line2.length);
+  const fs1 = Math.max(70, Math.min(118, Math.floor(1700 / Math.max(10, longest))));
+  const hl = (h.highlight || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const color = (w) => (hl && w.toLowerCase().replace(/[^a-z0-9]/g, '') === hl ? `{\\c&H0026D9FF&}${w}{\\c&H00FFFFFF&}` : w);
+  const line = (l) => assEsc(l).split(/\s+/).map(color).join(' ');
+  const ass = path.join(rd, 'thumb.ass');
+  fs.writeFileSync(ass, `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${W}
+PlayResY: ${H}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: T,Poppins Black,${fs1},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,7,4,8,90,90,330,1
+Style: M,Poppins Black,34,&H60FFFFFF,&H60FFFFFF,&H90000000,&H00000000,0,0,0,0,100,100,1,0,1,1,0,2,0,0,300,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:05.00,T,,0,0,0,,${line(h.line1)}\\N${line(h.line2)}
+Dialogue: 0,0:00:00.00,0:00:05.00,M,,0,0,0,,${assEsc(ENV.WATERMARK || '@zindagikasach')}
+`, 'utf8');
+  const rel = (p) => path.relative(process.cwd(), p).replace(/\\/g, '/');
+  run('ffmpeg', ['-v', 'error', '-y', '-i', img, '-filter_complex',
+    `[0]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=30,eq=brightness=-0.28[bg];`
+    + `[0]scale=860:860[fg];[bg][fg]overlay=(W-w)/2:720,subtitles='${rel(ass)}':fontsdir='${rel(DIR.fonts)}'`,
+    '-frames:v', '1', s.thumb]);
 }
 
 // ---------- step 5: post (Facebook Reels API) ----------
@@ -328,7 +398,8 @@ function preflight(s) {
   if (!v || v.width !== W || v.height !== H) bad.push('video not 1080x1920');
   if (!a) bad.push('no audio');
   if (!(secs >= 12 && secs <= 90)) bad.push(`length ${secs.toFixed(1)} s`);
-  if (Math.abs(secs - s.voiceDur) > 0.5) bad.push('video/voice length differ');
+  if (Math.abs(secs - s.voiceDur - THUMB_SECS) > 0.5) bad.push('video/voice length differ');
+  if (!s.thumb || !fs.existsSync(s.thumb)) bad.push('missing thumbnail');
   if (s.timeline.some((sc) => !fs.existsSync(sc.file))) bad.push('missing image');
   if (bad.length) throw new Error('preflight: ' + bad.join(', '));
   return secs;
@@ -355,16 +426,56 @@ async function publishFacebook(s) {
     if (vs.video_status === 'error') { log('FB processing error: ' + JSON.stringify(vs).slice(0, 200)); break; }
     if (vs.publishing_phase?.status === 'complete' || vs.video_status === 'ready') link = st.body.permalink_url;
   }
+  // custom cover (the reel is already public: a failure here is only logged)
+  const fd = new FormData();
+  fd.append('source', new Blob([fs.readFileSync(s.thumb)], { type: 'image/png' }), 'thumb.png');
+  fd.append('is_preferred', 'true'); fd.append('access_token', tok);
+  const th = await httpJson(`${GRAPH}/${videoId}/thumbnails`, { method: 'POST', body: fd }, 120000);
+  log(th.ok ? 'facebook thumbnail set' : 'facebook thumbnail failed: ' + JSON.stringify(th.body).slice(0, 160));
   return link ? (link.startsWith('http') ? link : 'https://www.facebook.com' + link) : `https://www.facebook.com/reel/${videoId}`;
 }
-async function instagramOnce(s) {
+// Instagram version: the API fails above ~44.5 s, but the story must stay whole: first speed up (max 1.15×, pitch
+// kept); if that is not enough, drop the longest middle scenes (never scene 1 or the last two: twist + lesson).
+function makeInstagramVersion(s) {
+  const total = s.videoDur;
+  if (total <= IG_MAX) return s.output;
+  const MAX_SPEED = 1.15, off = THUMB_SECS;
+  const cut = [];
+  let keep = total;
+  const middle = s.timeline.map((sc, i) => ({ i, len: sc.end - sc.start })).slice(1, -2).sort((a, b) => b.len - a.len);
+  // cut as little as possible: the shortest single middle scene that is enough, else the longest and repeat
+  while (keep / MAX_SPEED > IG_MAX - 0.5 && middle.length) {
+    const enough = middle.filter((m) => (keep - m.len) / MAX_SPEED <= IG_MAX - 0.5).sort((a, b) => a.len - b.len)[0];
+    const m = enough || middle[0];
+    middle.splice(middle.indexOf(m), 1); cut.push(m.i); keep -= m.len;
+  }
+  const speed = Math.max(1, keep / (IG_MAX - 0.5));
+  // segments to keep, in video time
+  const segs = []; let t = 0;
+  for (const i of cut.sort((a, b) => a - b)) { const sc = s.timeline[i]; segs.push([t, sc.start + off]); t = sc.end + off; }
+  segs.push([t, total]);
+  const parts = segs.map(([a, b], k) => `[0:v]trim=${a.toFixed(3)}:${b.toFixed(3)},setpts=PTS-STARTPTS[v${k}];[0:a]atrim=${a.toFixed(3)}:${b.toFixed(3)},asetpts=PTS-STARTPTS[a${k}];`).join('');
+  const cat = segs.map((_, k) => `[v${k}][a${k}]`).join('') + `concat=n=${segs.length}:v=1:a=1[cv][ca];`
+    + `[cv]setpts=PTS/${speed.toFixed(4)}[v];[ca]atempo=${speed.toFixed(4)}[a]`;
+  const out = s.output.replace(/\.mp4$/, '_ig.mp4');
+  run('ffmpeg', ['-v', 'error', '-y', '-i', s.output, '-filter_complex', parts + cat, '-map', '[v]', '-map', '[a]',
+    '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p', '-r', String(FPS), '-c:a', 'aac', '-b:a', '160k',
+    '-movflags', '+faststart', out + '.tmp.mp4']);
+  fs.renameSync(out + '.tmp.mp4', out);
+  const d = dur(out);
+  log(`instagram version: ${d.toFixed(1)} s (speed ${speed.toFixed(2)}×, scenes cut: ${cut.length ? cut.join(',') : 'none'})`);
+  if (d > IG_MAX) throw new Error(`instagram version still ${d.toFixed(1)} s`);
+  return out;
+}
+async function instagramOnce(s, file) {
   const tok = ENV.FB_PAGE_ACCESS_TOKEN, ig = ENV.IG_USER_ID;
+  // cover = the thumbnail card the reel opens on (frame at 0.2 s)
   const c = await httpJson(`${GRAPH}/${ig}/media`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ media_type: 'REELS', upload_type: 'resumable', caption: caption(s.gen).slice(0, 2200), share_to_feed: true, thumb_offset: 500, access_token: tok }) }, 60000);
+    body: JSON.stringify({ media_type: 'REELS', upload_type: 'resumable', caption: caption(s.gen).slice(0, 2200), share_to_feed: true, thumb_offset: 200, access_token: tok }) }, 60000);
   if (!c.ok || !c.body.id) throw new Error('IG container failed: ' + JSON.stringify(c.body).slice(0, 300));
   const id = c.body.id;
-  const up = await httpJson(`https://rupload.facebook.com/ig-api-upload/v26.0/${id}`, { method: 'POST', body: fs.readFileSync(s.output),
-    headers: { Authorization: 'OAuth ' + tok, offset: '0', file_size: String(fs.statSync(s.output).size) } }, 600000);
+  const up = await httpJson(`https://rupload.facebook.com/ig-api-upload/v26.0/${id}`, { method: 'POST', body: fs.readFileSync(file),
+    headers: { Authorization: 'OAuth ' + tok, offset: '0', file_size: String(fs.statSync(file).size) } }, 600000);
   if (!up.ok || !up.body.success) throw new Error('IG upload failed: ' + JSON.stringify(up.body).slice(0, 300));
   let st = '';
   for (let k = 0; k < 40 && st !== 'FINISHED'; k++) {
@@ -379,12 +490,12 @@ async function instagramOnce(s) {
   const pl = (await httpJson(`${GRAPH}/${pub.body.id}?fields=permalink&access_token=${encodeURIComponent(tok)}`, {}, 30000)).body.permalink;
   return pl || 'https://www.instagram.com/';
 }
-async function publishInstagram(s, secs) {
+async function publishInstagram(s) {
   need('FB_PAGE_ACCESS_TOKEN', 'IG_USER_ID');
-  if (secs > IG_MAX) throw new Error(`reel is ${secs.toFixed(1)} s; Instagram API takes up to ~45 s`);
+  const file = makeInstagramVersion(s);
   // IG's upload server fails at random: up to 4 tries with a fresh container, never after a publish call
   for (let a = 1; ; a++) {
-    try { return await instagramOnce(s); } catch (e) {
+    try { return await instagramOnce(s, file); } catch (e) {
       if (a >= 4 || e.maybePosted || !/IG (container|upload|processing)/.test(e.message)) throw e;
       log(`instagram try ${a} failed (${e.message.slice(0, 90)}), retry in ${a * 45} s`); await sleep(a * 45000);
     }
@@ -414,10 +525,15 @@ async function publishYouTube(s) {
   if (!init.ok || !loc) throw new Error(`YouTube upload start failed: HTTP ${init.status} ${(await init.text()).slice(0, 200)}`);
   const up = await httpJson(loc, { method: 'PUT', headers: { 'Content-Type': 'video/mp4' }, body: fs.readFileSync(s.output) }, 600000);
   if (!up.ok || !up.body.id) throw new Error('YouTube upload failed: ' + JSON.stringify(up.body).slice(0, 200));
+  // custom thumbnail: needs a phone-verified channel; until then YouTube refuses it and the Short keeps its first
+  // frame, which is the same thumbnail card anyway
+  const th = await httpJson(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${up.body.id}`,
+    { method: 'POST', headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'image/png' }, body: fs.readFileSync(s.thumb) }, 120000);
+  log(th.ok ? 'youtube thumbnail set' : `youtube thumbnail not set (HTTP ${th.status}; verify the channel by phone to allow it)`);
   return `https://youtube.com/shorts/${up.body.id}`;
 }
-// YouTube gets ONE reel a day (mass-produced policy): only the run at a YT_HOURS hour (IST) uploads
-const ytSlot = () => (ENV.YT_HOURS || '18').split(',').map(Number).includes(new Date(Date.now() + 5.5 * 3600e3).getUTCHours());
+// YT_HOURS: IST hours whose run also goes to YouTube, or "all" (my choice 2026-11-02: both daily reels)
+const ytSlot = () => /^all$/i.test(ENV.YT_HOURS || '') || (ENV.YT_HOURS || '18').split(',').map(Number).includes(new Date(Date.now() + 5.5 * 3600e3).getUTCHours());
 async function stepPost(s) {
   const secs = preflight(s);
   if (!/^true$/i.test(ENV.POST_ENABLED || '')) { log('POST_ENABLED is not true → not posted (dry run)'); s.posted = { fb: 'dry-run' }; return; }
@@ -425,7 +541,7 @@ async function stepPost(s) {
   if (!s.posted.fb) { s.posted.fb = await publishFacebook(s); saveState(s); log('facebook posted: ' + s.posted.fb); }
   // Instagram is a separate step: its failure never blocks or repeats the Facebook post (new features default OFF)
   if (/^true$/i.test(ENV.IG_ENABLED || '') && !s.posted.ig) {
-    try { s.posted.ig = await publishInstagram(s, secs); log('instagram posted: ' + s.posted.ig); }
+    try { s.posted.ig = await publishInstagram(s); log('instagram posted: ' + s.posted.ig); }
     catch (e) { s.posted.ig = '❌ ' + e.message.slice(0, 120); log('instagram failed: ' + e.message); }
   }
   if (/^true$/i.test(ENV.YT_ENABLED || '') && !s.posted.yt && (ytSlot() || process.env.FORCE_YT === 'true')) {
@@ -441,7 +557,8 @@ async function make(topic) {
   const s = { runId: istStamp().id, date: istStamp().date };
   RUN = s.runId; fs.mkdirSync(runDir(s.runId), { recursive: true });
   // the whole story must fit Facebook's 90 s limit: a too-long one is retold tighter (still complete), max 2 times
-  const maxSecs = /^true$/i.test(ENV.IG_ENABLED || '') ? IG_MAX : FB_MAX;
+  // Instagram gets its own shortened copy, so the story only has to fit Facebook (minus the cover card)
+  const maxSecs = FB_MAX - THUMB_SECS;
   for (let k = 0; ; k++) {
     await stepScript(s, topic, k, maxSecs); saveState(s);
     await stepVoice(s); saveState(s);
@@ -464,6 +581,8 @@ async function make(topic) {
       fs.appendFileSync(path.join(DIR.logs, 'used-topics.txt'), s.gen.topic + '\n', 'utf8');
       fs.writeFileSync(path.join(DIR.output, `ZKS_${s.runId}.txt`), caption(s.gen), 'utf8');
       console.log(JSON.stringify({ runId: s.runId, output: s.output }));
+    } else if (cmd === 'igtest') { // build only the Instagram copy of a rendered run (no upload)
+      RUN = arg; const s = loadState(arg); console.log(makeInstagramVersion(s));
     } else if (cmd === 'yttest') { // private test upload of a rendered run
       RUN = arg; const s = loadState(arg); preflight(s); ENV.YT_PRIVACY = 'private';
       console.log('youtube (private): ' + await publishYouTube(s));

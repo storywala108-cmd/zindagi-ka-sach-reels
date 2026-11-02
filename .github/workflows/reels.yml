@@ -2,8 +2,8 @@ name: Zindagi Ka Sach Reels
 
 on:
   schedule:
-    # GitHub cron is UTC: 03:30 and 12:30 UTC = 9 AM and 6 PM IST (YouTube only gets the 6 PM reel)
-    - cron: '30 3,12 * * *'
+    # GitHub cron is UTC and usually starts 30-60 min late: 02:45 + 11:45 UTC (8:15 AM + 5:15 PM IST) lands ~9 AM + ~6 PM IST
+    - cron: '45 2,11 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
