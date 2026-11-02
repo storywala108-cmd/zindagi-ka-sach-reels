@@ -20,3 +20,6 @@ Downloaded 2026-11-01 from mixkit.co (mood: sad / emotional).
 
 ## Fonts
 - Poppins Black — SIL Open Font License (`fonts/poppins-OFL.txt`).
+
+## Brand icons (asked 2026-11-02)
+- Facebook, YouTube, Instagram logos from Simple Icons v13.21.0 (CC0), used only to point to our own profiles (`brand/handles.png`).
