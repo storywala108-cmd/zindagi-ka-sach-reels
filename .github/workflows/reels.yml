@@ -4,8 +4,15 @@ on:
   schedule:
     # GitHub cron is UTC and usually starts 30-60 min late: 02:45 + 11:45 UTC (8:15 AM + 5:15 PM IST) lands ~9 AM + ~6 PM IST
     - cron: '45 2,11 * * *'
+    # stock maker: every 4 hours (IST ~1:50, 5:50, 9:50 AM/PM), tops the Drive stock up to 5 reels
+    - cron: '20 20,0,4,8,12,16 * * *'
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'publish = post oldest stock reel, stock = fill Drive stock, fresh = make + post now'
+        type: choice
+        options: [publish, stock, fresh]
+        default: stock
       dry_run:
         description: 'Dry run: make the reel but do not post'
         type: boolean
@@ -78,13 +85,16 @@ jobs:
           if [ "$DRY" = "true" ]; then sed -i 's/^POST_ENABLED=.*/POST_ENABLED=false/' .env; fi
           mkdir -p temp output logs
 
-      - name: Make and post the reel
+      # 9 AM / 6 PM: post the oldest reel from the Google Drive stock; other runs top the stock up (Charon voice only)
+      - name: Publish from stock / make stock
         env:
           REEL_ROOT: ${{ github.workspace }}
           DRY_RUN: ${{ inputs.dry_run }}
           FORCE_YT: ${{ inputs.youtube }}
           PYTHON: python
-        run: node scripts/zks.js all "${{ inputs.topic }}"
+          MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '45 2,11 * * *' && 'publish' || 'stock') || inputs.mode }}
+        run: |
+          if [ "$MODE" = "fresh" ]; then node scripts/zks.js all "${{ inputs.topic }}"; else node scripts/zks.js "$MODE"; fi
 
       - name: Keep the reel for 7 days
         if: always()

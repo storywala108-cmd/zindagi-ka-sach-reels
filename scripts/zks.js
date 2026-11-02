@@ -419,7 +419,7 @@ function preflight(s) {
   if (!(secs >= 12 && secs <= 90)) bad.push(`length ${secs.toFixed(1)} s`);
   if (Math.abs(secs - s.voiceDur - THUMB_SECS) > 0.5) bad.push('video/voice length differ');
   if (!s.thumb || !fs.existsSync(s.thumb)) bad.push('missing thumbnail');
-  if (s.timeline.some((sc) => !fs.existsSync(sc.file))) bad.push('missing image');
+  if (!s.fromStock && s.timeline.some((sc) => !fs.existsSync(sc.file))) bad.push('missing image');
   if (bad.length) throw new Error('preflight: ' + bad.join(', '));
   return secs;
 }
@@ -591,10 +591,60 @@ async function make(topic) {
   fs.writeFileSync(path.join(DIR.output, `ZKS_${s.runId}.txt`), caption(s.gen), 'utf8');
   return s;
 }
+// ---------- Google Drive stock (asked 2026-11-02) ----------
+// Reels are made ahead (only with the Charon voice) and kept in Drive, so a busy Gemini never forces another voice:
+// "stock" tops the Drive folder up to STOCK_TARGET reels; "publish" posts the oldest one and deletes it from Drive.
+const drive = require('./drive.js');
+const STOCK_FOLDER = 'Zindagi Ka Sach Stock';
+const stockKind = (n) => (n.endsWith('_thumb.png') ? 'thumb' : n.endsWith('.json') ? 'state' : n.endsWith('.mp4') ? 'video' : '');
+async function stockItems(fid) {
+  const byRun = {};
+  for (const f of await drive.list(fid)) {
+    const id = f.appProperties?.runId; const k = stockKind(f.name);
+    if (id && k) (byRun[id] = byRun[id] || { runId: id })[k] = f;
+  }
+  return Object.values(byRun).filter((x) => x.video && x.thumb && x.state).sort((a, b) => a.runId.localeCompare(b.runId));
+}
+async function stock() {
+  need('DRIVE_REFRESH_TOKEN'); drive.init(ENV);
+  const fid = await drive.folder(STOCK_FOLDER);
+  const target = parseInt(ENV.STOCK_TARGET || '5', 10), perRun = parseInt(ENV.STOCK_PER_RUN || '3', 10);
+  let have = (await stockItems(fid)).length;
+  log(`stock: ${have}/${target} reels in Drive`);
+  for (let made = 0; have < target && made < perRun; made++) {
+    const s = await make(); // throws (nothing stored) when Charon is unavailable
+    preflight(s);
+    const p = { runId: s.runId };
+    await drive.upload(s.output, path.basename(s.output), fid, 'video/mp4', p);
+    await drive.upload(s.thumb, path.basename(s.thumb), fid, 'image/png', p);
+    const st = path.join(runDir(s.runId), 'state.json');
+    await drive.upload(st, `ZKS_${s.runId}.json`, fid, 'application/json', p);
+    have++; log(`stock: stored ${s.runId} (${have}/${target})`);
+  }
+}
+async function publishFromStock() {
+  need('DRIVE_REFRESH_TOKEN'); drive.init(ENV);
+  const fid = await drive.folder(STOCK_FOLDER);
+  const items = await stockItems(fid);
+  if (!items.length) { log('stock empty → making a fresh reel now'); const s = await make(); await stepPost(s); saveState(s); return; }
+  const it = items[0];
+  RUN = it.runId; fs.mkdirSync(runDir(it.runId), { recursive: true }); fs.mkdirSync(DIR.output, { recursive: true });
+  const st = path.join(runDir(it.runId), 'state.json');
+  await drive.download(it.state.id, st);
+  const s = loadState(it.runId);
+  s.output = path.join(DIR.output, it.video.name); s.thumb = path.join(DIR.output, it.thumb.name); s.fromStock = true;
+  await drive.download(it.video.id, s.output); await drive.download(it.thumb.id, s.thumb);
+  log(`publish from stock: ${it.runId} (${items.length - 1} left)`);
+  await stepPost(s); saveState(s);
+  // delete from Drive only once Facebook has it (the main post); IG/YT failures are logged, never re-posted
+  if (s.posted?.fb && s.posted.fb !== 'dry-run') for (const f of [it.video, it.thumb, it.state]) await drive.remove(f.id);
+}
 (async () => {
   const [cmd, arg] = process.argv.slice(2);
   try {
-    if (cmd === 'make') { const s = await make(arg); console.log(JSON.stringify({ runId: s.runId, output: s.output })); }
+    if (cmd === 'stock') await stock();
+    else if (cmd === 'publish') await publishFromStock();
+    else if (cmd === 'make') { const s = await make(arg); console.log(JSON.stringify({ runId: s.runId, output: s.output })); }
     else if (cmd === 'resume') { // finish a failed run from its images (script + voice kept)
       RUN = arg; const s = loadState(arg); await stepImages(s); saveState(s); stepRender(s); saveState(s);
       fs.appendFileSync(path.join(DIR.logs, 'used-topics.txt'), s.gen.topic + '\n', 'utf8');
