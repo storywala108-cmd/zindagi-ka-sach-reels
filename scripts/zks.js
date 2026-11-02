@@ -257,12 +257,18 @@ async function stepImages(s) {
 // ---------- step 4: render (FFmpeg) ----------
 const assTime = (t) => { const cs = Math.max(0, Math.round(t * 100)); return `${Math.floor(cs / 360000)}:${String(Math.floor(cs / 6000) % 60).padStart(2, '0')}:${String(Math.floor(cs / 100) % 60).padStart(2, '0')}.${String(cs % 100).padStart(2, '0')}`; };
 const assEsc = (x) => String(x).replace(/[{}\\]/g, '').trim();
+// all three handles in the old watermark style (asked 2026-11-02), two lines so they fit the 1080 px width
+function handlesMark() {
+  const fb = ENV.FB_HANDLE || 'zindagikasach.kahani', yt = ENV.YT_HANDLE || '@zindagikasach.kahani';
+  const ig = ENV.IG_HANDLE || '@' + (ENV.IG_USERNAME || 'zindagi_ka_sach8');
+  return `${assEsc(`FB: ${fb}  ·  YT: ${yt}`)}\\N${assEsc(`IG: ${ig}`)}`;
+}
 function buildAss(s) {
   const YEL = '&H0026D9FF&', WHT = '&H00FFFFFF&', total = s.voiceDur;
   const hl = (s.gen.hook.highlight || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const hookLine = (l) => assEsc(l).split(/\s+/).map((w) => (w.toLowerCase().replace(/[^a-z0-9]/g, '') === hl && hl ? `{\\c${YEL}}${w}{\\c${WHT}}` : w)).join(' ');
   const ev = [`Dialogue: 1,${assTime(0)},${assTime(total)},Hook,,0,0,0,,${hookLine(s.gen.hook.line1)}\\N${hookLine(s.gen.hook.line2)}`];
-  ev.push(`Dialogue: 1,${assTime(0)},${assTime(total)},Mark,,0,0,0,,${assEsc(ENV.WATERMARK || '@zindagikasach')}`);
+  ev.push(`Dialogue: 1,${assTime(0)},${assTime(total)},Mark,,0,0,0,,${handlesMark()}`);
   // subtitles: 2-4 words a line under the picture, the spoken word pops yellow and a bit bigger
   for (const sc of s.timeline) {
     const chunks = []; let cur = [];
@@ -285,7 +291,7 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Hook,Poppins Black,66,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,70,70,${IMG_Y - 190},1
 Style: Sub,Poppins Black,64,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,2,8,60,60,${IMG_Y + IMG + 50},1
-Style: Mark,Poppins Black,30,&H70FFFFFF,&H70FFFFFF,&H90000000,&H00000000,0,0,0,0,100,100,1,0,1,1,0,2,0,0,${H - IMG_Y - IMG + 24},1
+Style: Mark,Poppins Black,26,&H30FFFFFF,&H30FFFFFF,&H50000000,&H00000000,0,0,0,0,100,100,1,0,1,2,0,2,0,0,${H - IMG_Y - IMG + 24},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -367,12 +373,12 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: T,Poppins Black,${fs1},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,7,4,8,90,90,330,1
-Style: M,Poppins Black,34,&H60FFFFFF,&H60FFFFFF,&H90000000,&H00000000,0,0,0,0,100,100,1,0,1,1,0,2,0,0,300,1
+Style: M,Poppins Black,28,&H30FFFFFF,&H30FFFFFF,&H50000000,&H00000000,0,0,0,0,100,100,1,0,1,2,0,2,0,0,300,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.00,0:00:05.00,T,,0,0,0,,${line(h.line1)}\\N${line(h.line2)}
-Dialogue: 0,0:00:00.00,0:00:05.00,M,,0,0,0,,${assEsc(ENV.WATERMARK || '@zindagikasach')}
+Dialogue: 0,0:00:00.00,0:00:05.00,M,,0,0,0,,${handlesMark()}
 `, 'utf8');
   const rel = (p) => path.relative(process.cwd(), p).replace(/\\/g, '/');
   run('ffmpeg', ['-v', 'error', '-y', '-i', img, '-filter_complex',
